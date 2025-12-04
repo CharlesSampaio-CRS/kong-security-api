@@ -9,10 +9,11 @@ mod middleware;
 mod api_doc;
 mod cache;
 
-use actix_web::{App, HttpServer, middleware::{Logger, Compress}, web, HttpResponse, http::header};
+use actix_web::{web, App, HttpResponse, http::header, middleware::{Logger, Compress}};
 use actix_cors::Cors;
-use dotenv::dotenv;
-use database::connect_to_database;
+use shuttle_actix_web::ShuttleActixWeb;
+use shuttle_runtime::SecretStore;
+use mongodb::Client;
 use services::{UserService, LogService, PasswordResetService, TenantService};
 use api::handlers::auth_handlers::*;
 use api::handlers::log_handlers::*;
@@ -27,14 +28,30 @@ use utoipa_swagger_ui::SwaggerUi;
 use api_doc::ApiDoc;
 use cache::{RedisCache, CacheConfig};
 
-#[actix_web::main]
-async fn main() -> std::io::Result<()> {
-
-    dotenv().ok();
+#[shuttle_runtime::main]
+async fn main(
+    #[shuttle_runtime::Secrets] secrets: SecretStore,
+) -> ShuttleActixWeb<impl FnOnce(&mut web::ServiceConfig) + Send + Clone + 'static> {
+    
+    // Initialize logger
     env_logger::init();
-
-    // Conectar ao MongoDB com pool otimizado
-    let db = connect_to_database().await.expect("Failed to connect to database");
+    
+    // Get secrets
+    let mongodb_uri = secrets.get("MONGODB_URI")
+        .expect("MONGODB_URI secret not found");
+    let redis_url = secrets.get("REDIS_URL")
+        .ok(); // Redis é opcional
+    let jwt_secret = secrets.get("JWT_SECRET")
+        .expect("JWT_SECRET secret not found");
+    
+    log::info!("🚀 Starting Kong Security API with Shuttle...");
+    
+    // Connect to MongoDB
+    let client = Client::with_uri_str(&mongodb_uri)
+        .await
+        .expect("Failed to connect to MongoDB");
+    
+    let db = client.database("kong-security-api");
     
     // Initialize database indexes
     log::info!("🔧 Initializing database indexes...");
@@ -43,45 +60,58 @@ async fn main() -> std::io::Result<()> {
         panic!("Database indexes initialization failed");
     }
     
-    // Inicializar cache Redis (opcional - sistema funciona sem cache)
-    let cache = match RedisCache::new(CacheConfig::default()) {
-        Ok(c) => {
-            match c.ping().await {
-                Ok(_) => {
-                    log::info!("✅ Redis cache connected and ready");
-                    Some(c)
-                }
-                Err(e) => {
-                    log::warn!("⚠️  Redis ping failed: {}. Running without cache.", e);
-                    None
+    // Initialize Redis cache (optional)
+    let cache = if let Some(redis_url) = redis_url {
+        match RedisCache::new(CacheConfig {
+            redis_url: redis_url.clone(),
+            max_connections: 10,
+            connection_timeout: std::time::Duration::from_secs(5),
+        }) {
+            Ok(c) => {
+                match c.ping().await {
+                    Ok(_) => {
+                        log::info!("✅ Redis cache connected");
+                        Some(c)
+                    }
+                    Err(e) => {
+                        log::warn!("⚠️  Redis ping failed: {}. Running without cache.", e);
+                        None
+                    }
                 }
             }
+            Err(e) => {
+                log::warn!("⚠️  Redis connection failed: {}. Running without cache.", e);
+                None
+            }
         }
-        Err(e) => {
-            log::warn!("⚠️  Redis connection failed: {}. Running without cache.", e);
-            None
-        }
+    } else {
+        log::info!("ℹ️  Redis URL not provided. Running without cache.");
+        None
     };
     
-    // Initialize services with cache
+    // Initialize services
     let tenant_service = web::Data::new(TenantService::new(&db, cache.clone()));
     let user_service = web::Data::new(UserService::new(db.clone()));
     let log_service = web::Data::new(LogService::new(db.clone(), cache.clone()));
     let reset_service = web::Data::new(PasswordResetService::new(&db));
     
-    log::info!("✅ Database connected successfully");
+    log::info!("✅ Services initialized successfully");
     
-    // Log startup information with URLs
-    log_startup_info(cache.is_some());
-
     // Generate OpenAPI spec
     let openapi = ApiDoc::openapi();
-
-    HttpServer::new(move || {
+    
+    // Log startup info
+    log_startup_info(cache.is_some());
+    
+    let config = move |cfg: &mut web::ServiceConfig| {
         // Configure CORS
         let cors = Cors::default()
-            .allowed_origin("http://localhost:3000") // Frontend origin
-            .allowed_origin("http://localhost:8080") // API origin
+            .allowed_origin("http://localhost:3000")
+            .allowed_origin("http://localhost:8080")
+            .allowed_origin_fn(|origin, _| {
+                // Allow Shuttle domains
+                origin.as_bytes().ends_with(b"shuttleapp.rs")
+            })
             .allowed_methods(vec!["GET", "POST", "PUT", "DELETE", "OPTIONS"])
             .allowed_headers(vec![
                 header::AUTHORIZATION,
@@ -90,101 +120,93 @@ async fn main() -> std::io::Result<()> {
             ])
             .max_age(3600)
             .supports_credentials();
-
-        App::new()
+        
+        cfg
             // Global middleware
-            .wrap(cors)
-            .wrap(Compress::default()) // Compressão automática (gzip/brotli)
-            .wrap(Logger::default())
-            
-            // Application data
             .app_data(web::Data::new(db.clone()))
             .app_data(tenant_service.clone())
             .app_data(user_service.clone())
             .app_data(log_service.clone())
             .app_data(reset_service.clone())
-            .app_data(web::JsonConfig::default().limit(512 * 1024)) // 512KB JSON limit (reduzido)
-            
-            // Health check endpoint (sem validação de tenant)
-            .route("/api/health", web::get().to(health_check))
-            
-            // Swagger UI (sem validação de tenant)
+            .app_data(web::JsonConfig::default().limit(512 * 1024))
             .service(
-                SwaggerUi::new("/api/swagger-ui/{_:.*}")
-                    .url("/api/api-docs/openapi.json", openapi.clone())
-            )
-            
-            // API routes with Tenant Validation
-            .service(
-                web::scope("/api")
-                    .wrap(TenantValidator::new(db.clone()))
-                    // Authentication
+                web::scope("")
+                    .wrap(cors)
+                    .wrap(Compress::default())
+                    .wrap(Logger::default())
+                    
+                    // Health check endpoint
+                    .route("/api/health", web::get().to(health_check))
+                    
+                    // Swagger UI
                     .service(
-                        web::scope("/auth")
-                            .route("/login", web::post().to(login))
-                            .route("/register", web::post().to(register))
-                            .route("/protected", web::get().to(protected))
-                            // Password Reset endpoints
-                            .route("/password-reset/request", web::post().to(request_password_reset))
-                            .route("/password-reset/validate", web::post().to(validate_reset_token))
-                            .route("/password-reset/confirm", web::post().to(confirm_password_reset))
+                        SwaggerUi::new("/api/swagger-ui/{_:.*}")
+                            .url("/api/api-docs/openapi.json", openapi.clone())
                     )
-                    // Tenants Management (Admin only)
+                    
+                    // API routes with Tenant Validation
                     .service(
-                        web::scope("/tenants")
-                            .route("", web::post().to(api::handlers::tenant_handlers::create_tenant))
-                            .route("", web::get().to(api::handlers::tenant_handlers::list_tenants))
-                            .route("/{tenant_id}", web::get().to(api::handlers::tenant_handlers::get_tenant))
-                            .route("/{tenant_id}", web::put().to(api::handlers::tenant_handlers::update_tenant))
-                            .route("/{tenant_id}", web::delete().to(api::handlers::tenant_handlers::delete_tenant))
-                            .route("/{tenant_id}/activate", web::post().to(api::handlers::tenant_handlers::activate_tenant))
-                            .route("/{tenant_id}/deactivate", web::post().to(api::handlers::tenant_handlers::deactivate_tenant))
+                        web::scope("/api")
+                            .wrap(TenantValidator::new(db.clone()))
+                            // Authentication
+                            .service(
+                                web::scope("/auth")
+                                    .route("/login", web::post().to(login))
+                                    .route("/register", web::post().to(register))
+                                    .route("/protected", web::get().to(protected))
+                                    // Password Reset
+                                    .route("/password-reset/request", web::post().to(request_password_reset))
+                                    .route("/password-reset/validate", web::post().to(validate_reset_token))
+                                    .route("/password-reset/confirm", web::post().to(confirm_password_reset))
+                            )
+                            // Tenants Management
+                            .service(
+                                web::scope("/tenants")
+                                    .route("", web::post().to(api::handlers::tenant_handlers::create_tenant))
+                                    .route("", web::get().to(api::handlers::tenant_handlers::list_tenants))
+                                    .route("/{tenant_id}", web::get().to(api::handlers::tenant_handlers::get_tenant))
+                                    .route("/{tenant_id}", web::put().to(api::handlers::tenant_handlers::update_tenant))
+                                    .route("/{tenant_id}", web::delete().to(api::handlers::tenant_handlers::delete_tenant))
+                                    .route("/{tenant_id}/activate", web::post().to(api::handlers::tenant_handlers::activate_tenant))
+                                    .route("/{tenant_id}/deactivate", web::post().to(api::handlers::tenant_handlers::deactivate_tenant))
+                            )
+                            // Logs
+                            .service(
+                                web::scope("/logs")
+                                    .route("/my-logins", web::get().to(get_my_logs))
+                            )
+                            // Admin
+                            .service(
+                                web::scope("/admin")
+                                    .route("/logs", web::get().to(get_all_logs))
+                                    .route("/logs/stats", web::get().to(get_login_stats))
+                            )
                     )
-                    // Logs
-                    .service(
-                        web::scope("/logs")
-                            .route("/my-logins", web::get().to(get_my_logs))
-                    )
-                    // Admin
-                    .service(
-                        web::scope("/admin")
-                            .route("/logs", web::get().to(get_all_logs))
-                            .route("/logs/stats", web::get().to(get_login_stats))
-                    )
-            )
-    })
-    .bind(("0.0.0.0", 8080))
-    .expect("Failed to bind server to address")
-    .run()
-    .await
+            );
+    };
+    
+    Ok(config.into())
 }
 
 /// Log server startup information
 fn log_startup_info(cache_enabled: bool) {
     println!("\n╔══════════════════════════════════════════════════════════════╗");
-    println!("║          🚀 Kong Security API - Server Started              ║");
+    println!("║       🚀 Kong Security API - Shuttle Deployment             ║");
     println!("╠══════════════════════════════════════════════════════════════╣");
-    println!("║  📍 Server URL:    http://localhost:8080/api                ║");
-    println!("║  📊 Swagger UI:    http://localhost:8080/api/swagger-ui/    ║");
-    println!("║  📖 OpenAPI Spec:  http://localhost:8080/api/api-docs/openapi.json ║");
-    println!("║  ❤️  Health Check:  http://localhost:8080/api/health         ║");
+    println!("║  📍 Deployment:    Shuttle.rs                               ║");
+    println!("║  📊 Swagger UI:    /api/swagger-ui/                        ║");
+    println!("║  ❤️  Health Check:  /api/health                             ║");
     println!("╠══════════════════════════════════════════════════════════════╣");
     println!("║  🔒 Security Features Enabled:                              ║");
     println!("║     ✅ CORS Protection                                       ║");
     println!("║     ✅ JWT RS256 Authentication                              ║");
     println!("║     ✅ BCrypt Password Hashing                               ║");
-    println!("║     ✅ Input Validation & Sanitization                       ║");
-    println!("║     ✅ Password Strength Requirements                        ║");
-    println!("║     ✅ SQL Injection Prevention                              ║");
-    println!("║     ✅ XSS Prevention                                        ║");
-    println!("║     ✅ Comprehensive Audit Logging                           ║");
+    println!("║     ✅ Multi-Tenant Isolation                                ║");
     println!("╠══════════════════════════════════════════════════════════════╣");
     println!("║  ⚡ Performance Features:                                    ║");
-    println!("║     {} Redis Cache (Tenants & Logs)", if cache_enabled { "✅" } else { "⚠️ " });
-    println!("║     ✅ MongoDB Connection Pooling (max 10)                   ║");
-    println!("║     ✅ Response Compression (gzip/brotli)                    ║");
-    println!("║     ✅ Optimized Database Queries                            ║");
-    println!("║     ✅ Zstd/Snappy MongoDB Compression                       ║");
+    println!("║     {} Redis Cache", if cache_enabled { "✅" } else { "⚠️ " });
+    println!("║     ✅ MongoDB Connection Pooling                            ║");
+    println!("║     ✅ Response Compression                                  ║");
     println!("╚══════════════════════════════════════════════════════════════╝\n");
 }
 
@@ -193,13 +215,11 @@ async fn health_check(
     db: web::Data<mongodb::Database>,
     tenant_service: web::Data<TenantService>,
 ) -> HttpResponse {
-    // Check database connection
     let db_status = match db.list_collection_names().await {
         Ok(_) => "connected",
         Err(_) => "disconnected",
     };
 
-    // Check cache status (via tenant_service)
     let cache_status = if tenant_service.get_ref().cache.is_some() {
         "enabled"
     } else {
@@ -208,27 +228,11 @@ async fn health_check(
 
     HttpResponse::Ok().json(serde_json::json!({
         "status": "healthy",
-        "version": "1.1.0",
+        "version": "2.0.0-shuttle",
+        "platform": "shuttle.rs",
         "database": db_status,
         "cache": cache_status,
         "timestamp": chrono::Utc::now().to_rfc3339(),
-        "security_features": [
-            "CORS Protection",
-            "JWT RS256 Authentication",
-            "BCrypt Password Hashing",
-            "Password Strength Validation",
-            "Email Format Validation",
-            "Input Sanitization",
-            "SQL Injection Prevention",
-            "Comprehensive Audit Logging"
-        ],
-        "performance_features": [
-            "Redis Cache (Tenants & Logs)",
-            "MongoDB Connection Pooling",
-            "Response Compression",
-            "Optimized Queries",
-            "Zstd/Snappy Compression"
-        ]
     }))
 }
 
