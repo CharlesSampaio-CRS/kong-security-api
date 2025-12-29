@@ -13,7 +13,7 @@ use actix_web::{App, HttpServer, middleware::{Logger, Compress}, web, HttpRespon
 use actix_cors::Cors;
 use dotenv::dotenv;
 use database::connect_to_database;
-use services::{UserService, LogService, PasswordResetService, TenantService};
+use services::{UserService, LogService, PasswordResetService, TenantService, OAuthService, OAuthConfig};
 use api::handlers::auth_handlers::*;
 use api::handlers::log_handlers::*;
 use api::handlers::password_reset::{
@@ -21,11 +21,13 @@ use api::handlers::password_reset::{
     validate_reset_token,
     confirm_password_reset,
 };
+use api::handlers::oauth_handlers;
 use middleware::TenantValidator;
 use utoipa::OpenApi;
 use utoipa_swagger_ui::SwaggerUi;
 use api_doc::ApiDoc;
 use cache::{RedisCache, CacheConfig};
+use std::env;
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
@@ -69,6 +71,30 @@ async fn main() -> std::io::Result<()> {
     let log_service = web::Data::new(LogService::new(db.clone(), cache.clone()));
     let reset_service = web::Data::new(PasswordResetService::new(&db));
     
+    // Initialize OAuth Service (Google + Apple)
+    log::info!("🔧 Initializing OAuth services...");
+    let google_config = OAuthConfig {
+        client_id: env::var("GOOGLE_CLIENT_ID").expect("GOOGLE_CLIENT_ID must be set"),
+        client_secret: env::var("GOOGLE_CLIENT_SECRET").expect("GOOGLE_CLIENT_SECRET must be set"),
+        redirect_url: env::var("GOOGLE_REDIRECT_URL").expect("GOOGLE_REDIRECT_URL must be set"),
+        auth_url: "https://accounts.google.com/o/oauth2/v2/auth".to_string(),
+        token_url: "https://oauth2.googleapis.com/token".to_string(),
+    };
+    
+    let apple_config = OAuthConfig {
+        client_id: env::var("APPLE_CLIENT_ID").expect("APPLE_CLIENT_ID must be set"),
+        client_secret: env::var("APPLE_CLIENT_SECRET").expect("APPLE_CLIENT_SECRET must be set"),
+        redirect_url: env::var("APPLE_REDIRECT_URL").expect("APPLE_REDIRECT_URL must be set"),
+        auth_url: "https://appleid.apple.com/auth/authorize".to_string(),
+        token_url: "https://appleid.apple.com/auth/token".to_string(),
+    };
+    
+    let oauth_service = web::Data::new(
+        OAuthService::new(Some(google_config), Some(apple_config))
+            .expect("Failed to initialize OAuth service")
+    );
+    log::info!("✅ OAuth services initialized (Google + Apple)");
+    
     log::info!("✅ Database connected successfully");
     
     // Log startup information with URLs
@@ -80,8 +106,10 @@ async fn main() -> std::io::Result<()> {
     HttpServer::new(move || {
         // Configure CORS
         let cors = Cors::default()
-            .allowed_origin("http://localhost:3000") // Frontend origin
+            .allowed_origin("http://localhost:3000") // Frontend web origin
             .allowed_origin("http://localhost:8080") // API origin
+            .allowed_origin("http://localhost:8081") // Expo Metro bundler (React Native)
+            .allowed_origin("http://localhost:19006") // Expo web
             .allowed_methods(vec!["GET", "POST", "PUT", "DELETE", "OPTIONS"])
             .allowed_headers(vec![
                 header::AUTHORIZATION,
@@ -103,10 +131,19 @@ async fn main() -> std::io::Result<()> {
             .app_data(user_service.clone())
             .app_data(log_service.clone())
             .app_data(reset_service.clone())
+            .app_data(oauth_service.clone())
             .app_data(web::JsonConfig::default().limit(512 * 1024)) // 512KB JSON limit (reduzido)
             
             // Health check endpoint (sem validação de tenant)
             .route("/api/health", web::get().to(health_check))
+            
+            // OAuth callback HTML page (serve arquivo estático)
+            .route("/oauth-callback.html", web::get().to(|| async {
+                let html = include_str!("../static/oauth-callback.html");
+                HttpResponse::Ok()
+                    .content_type("text/html; charset=utf-8")
+                    .body(html)
+            }))
             
             // Swagger UI (sem validação de tenant)
             .service(
@@ -114,15 +151,25 @@ async fn main() -> std::io::Result<()> {
                     .url("/api/api-docs/openapi.json", openapi.clone())
             )
             
-            // API routes with Tenant Validation
+            // Public OAuth routes (NO Tenant Validation required)
+            .service(
+                web::scope("/api/auth")
+                    .route("/google", web::get().to(oauth_handlers::google_auth_url))
+                    .route("/google/callback", web::get().to(oauth_handlers::google_callback))
+                    .route("/apple", web::get().to(oauth_handlers::apple_auth_url))
+                    .route("/apple/callback", web::get().to(oauth_handlers::apple_callback))
+            )
+            
+            // API routes WITH Tenant Validation
             .service(
                 web::scope("/api")
                     .wrap(TenantValidator::new(db.clone()))
-                    // Authentication
+                    // Authentication (requires tenant)
                     .service(
                         web::scope("/auth")
                             .route("/login", web::post().to(login))
                             .route("/register", web::post().to(register))
+                            .route("/refresh", web::post().to(refresh_token))
                             .route("/protected", web::get().to(protected))
                             // Password Reset endpoints
                             .route("/password-reset/request", web::post().to(request_password_reset))
