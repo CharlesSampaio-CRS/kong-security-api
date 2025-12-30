@@ -1,2 +1,13 @@
-fly.toml
-.git/
+.git
+.gitignore
+.env
+.env.local
+.DS_Store
+*.log
+target
+Cargo.lock
+Dockerfile
+docker-compose.yml
+README.md
+.vscode
+.idea
